@@ -1,0 +1,9 @@
+{
+  "encoder":  {"name": "enc_base", "version": 1, "freeze": false},
+  "heads":    [
+    {"name": "discard",    "version": 1},
+    {"name": "pon_kan_hu", "version": 1}
+  ],
+  "source_checkpoint": null,
+  "comment": "模块融合 manifest 示例。规则迁移时填 source_checkpoint（如 runs/xxxx/checkpoints/best.pt），并新增目标规则特有 head（如 queque_v1, init=random）。模块版本登记见 src/mahjong_rl/models/registry.py"
+}

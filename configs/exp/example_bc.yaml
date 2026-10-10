@@ -1,0 +1,13 @@
+# 行为克隆实验模板 —— 实际运行时在 runs/<run_id>/config_resolved.yaml 留展开快照
+rule: riichi                    # 对应 configs/rules/<name>.yaml
+model_manifest: configs/models/fusion_example.json
+data:
+  source: tenhou                # data/<source>/ 下的统一格式牌谱
+  train_games: 500000
+  val_split: 0.1
+train:
+  algo: bc
+  lr: 1.0e-3
+  batch_size: 512
+  epochs: 10
+  seed: 42

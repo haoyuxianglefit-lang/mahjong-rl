@@ -1,0 +1,15 @@
+# 四川麻将（血战到底）—— 待实现：引擎未落地前 action_space / obs_shape 为估算值
+name: sichuan_xuezhan
+players: 4
+tile_count: 108
+tile_kinds: 34          # 字牌行置零；先保持 34 行便于从日麻权重迁移，落地后再评估是否收缩
+action_space: 0         # TODO(引擎落地后填实)：切牌/碰/杠/胡/过 + 定缺
+obs_shape: [0, 34]      # TODO(引擎落地后填实)
+has_riichi: false
+has_chii: false         # 川麻无吃
+has_honors: false       # 无字牌
+queque: true            # 开局定缺一门
+multi_win: true         # 血战到底：一家和牌后其余继续
+notes: >-
+  换三张、缺一门、刮风下雨(杠分即时结算)、查叫查卫生、胡牌过手规则。
+  引擎候选：改造 libriichi（参照 mortal-sanma 的改法）或移植 nanoserver(Go)/mj-yl(Node) 规则核。

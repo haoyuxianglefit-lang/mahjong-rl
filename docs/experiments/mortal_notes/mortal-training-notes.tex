@@ -1,0 +1,438 @@
+% !TEX program = xelatex
+% =====================================================================
+% Mortal 训练流程全解 —— 公式细节与迭代机制（学习笔记）
+% 基于 D:\Mahjong AI\Mortal 仓库源码（version 4, 本机 config.toml）
+% 编译：python <course-slides-digest>/scripts/compile_latex.py mortal-training-notes.tex
+% =====================================================================
+\documentclass[11pt,a4paper]{ctexart}
+\usepackage[margin=2.5cm,top=2.6cm,bottom=2.6cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,calc,positioning,shapes.geometric}
+
+% ---------- colors ----------
+\definecolor{nv}{HTML}{1F3864}
+\definecolor{bgblue}{HTML}{0B6E99}
+\definecolor{body}{HTML}{262626}
+\definecolor{notegray}{HTML}{595959}
+\definecolor{boxfill}{HTML}{EEF3FA}
+\definecolor{grpfill}{HTML}{FDF3E7}
+\definecolor{lossfill}{HTML}{F0F7EE}
+
+\usepackage[colorlinks=true,linkcolor=nv,urlcolor=nv,citecolor=nv]{hyperref}
+\usepackage{bookmark}
+\hypersetup{pdftitle={Mortal 训练流程全解},pdfsubject={离线 RL 麻将 AI 的公式与迭代机制}}
+
+% ---------- layout ----------
+\color{body}
+\setlength{\parskip}{4pt}
+\setlength{\parindent}{1.5em}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{\small\color{notegray} Mortal 训练流程全解 · 学习笔记}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\titleformat{\section}{\Large\bfseries\color{nv}}{\thesection}{0.8em}{}
+\titleformat{\subsection}{\large\bfseries\color{nv}}{\thesubsection}{0.8em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.8em}{}
+
+% ---------- math macros ----------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\lse}{logsumexp}
+
+\theoremstyle{remark}
+\newtheorem*{rem}{注}
+
+\begin{document}
+
+% ===================== 标题块 =====================
+\begin{center}
+  {\LARGE\bfseries\color{nv} Mortal 训练流程全解}\\[6pt]
+  {\Large 离线强化学习麻将 AI 的公式细节与迭代机制}\\[8pt]
+  {\small\color{notegray} 基于仓库源码（version 4）· \texttt{train.py / train\_grp.py / model.py / reward\_calculator.py / dataloader.py}\\
+   2026 年 9 月}
+\end{center}
+
+\vspace{4pt}
+\hrule
+\vspace{8pt}
+
+{\small\tableofcontents}
+\vspace{6pt}
+\hrule
+
+% =====================================================================
+\section{训练流水线总览}
+
+Mortal 的训练分为三个阶段，其中主训练内部还有\textbf{两层迭代}：内层是梯度下降更新网络参数；外层是``打败 baseline $\to$ 自己成为新 baseline $\to$ 再打败更强的自己''的自我提升循环。
+
+\begin{center}
+\begin{tikzpicture}[
+  font=\small,
+  stage/.style={draw=nv, thick, rounded corners=3pt, fill=boxfill, align=center,
+                minimum width=4.6cm, minimum height=1.1cm},
+  loop/.style={draw=bgblue, thick, rounded corners=3pt, fill=lossfill, align=center,
+               minimum width=4.2cm, minimum height=0.95cm},
+  arr/.style={-{Stealth[length=3mm]}, thick, nv},
+  lab/.style={font=\footnotesize\color{notegray}, align=center},
+]
+\node[stage] (data) {天凤牌谱\\[-2pt]{\footnotesize $\sim$212 万局 gzip .mjson}};
+\node[stage, fill=grpfill, below=0.9cm of data] (grp) {阶段 1：GRP 预训练\\[-2pt]{\footnotesize GRU $\to$ 24 类名次排列，\texttt{train\_grp.py}}};
+\node[stage, below=0.9cm of grp] (main) {阶段 2：离线 RL 主训练\\[-2pt]{\footnotesize MC 回归 + CQL + 辅助任务，\texttt{train.py}}};
+\node[loop, below=0.9cm of main] (eval) {外层迭代：\texttt{test\_play} 评估\\[-2pt]{\footnotesize 1 vs 3 对局 3000 场，双条件刷新 \texttt{best.pth}}};
+\node[stage, below=0.9cm of eval] (online) {阶段 3（可选）：在线自对弈\\[-2pt]{\footnotesize server $\rightleftarrows$ client $\rightleftarrows$ train，Boltzmann 探索}};
+
+\draw[arr] (data) -- (grp);
+\draw[arr] (grp) -- (main) node[midway, right, lab, xshift=2pt]{产出 \texttt{grp.pth}\\[-2pt]为奖励计算提供名次概率};
+\draw[arr] (main) -- (eval);
+\draw[arr] (eval) -- (online);
+\draw[arr, bgblue, dashed] (eval.east) .. controls +(2.2,0) and +(2.2,0) .. (main.east)
+  node[midway, right, lab, xshift=3pt]{\texttt{best.pth} $\to$ \texttt{baseline.pth}\\[-2pt]再训一轮（2--3 轮）};
+\end{tikzpicture}
+\end{center}
+
+本文按数据流向逐步展开：先讲 GRP 如何训练（\S\ref{sec:grp}），再讲它如何生成奖励（\S\ref{sec:reward}），然后是网络结构（\S\ref{sec:net}）、总损失（\S\ref{sec:loss}）、优化细节（\S\ref{sec:optim}），最后是两层迭代机制（\S\ref{sec:iter}）与在线模式（\S\ref{sec:online}）。
+
+% =====================================================================
+\section{问题建模与记号}
+
+麻雀的层级结构：一场\textbf{半庄}（game）$\supset$ 若干\textbf{局}（kyoku，东 1 $\dots$ 南 4）$\supset$ 若干\textbf{决策}（step）。约定：
+
+\begin{itemize}[leftmargin=2em]
+  \item 观测 $o_i \in \R^{1012 \times 34}$：34 个牌种位置上的 1012 通道手工特征平面（手牌、副露、舍牌历史、立直信息、场况等）；
+  \item 动作 $a_i \in \{0, \dots, 45\}$：46 个动作（34 种切牌 + 立直/杠/碰/吃/拔北/跳过等）；
+  \item 合法动作掩码 $m_i \in \{0,1\}^{46}$；
+  \item 顺位分向量 $\bm{p} = [6, 4, 2, 0]^{\top}$（\texttt{config.toml} 的 \texttt{pts}）；
+  \item 折扣因子 $\gamma = 1$（本机配置），即纯蒙特卡洛设定。
+\end{itemize}
+
+MDP 视角下，Mortal 学习的是动作价值函数 $Q(o, a)$，目标是``当前决策对最终成绩（以期望顺位分计）的贡献''。由于终局信号只有最终名次一个，极度稀疏，因此整个训练的第一步是\textbf{用 GRP 把终局信号稠密化到每一局}。
+
+% =====================================================================
+\section{阶段 1：GRP（Game Result Predictor）}\label{sec:grp}
+
+\subsection{动机与任务定义}
+
+\textbf{动机}：如果奖励只在半庄结束时给出一次，信用分配（credit assignment）将无法进行。GRP 的任务是：\textbf{给定每局结束时的场况与四家分数，预测最终的完整名次排列}。有了逐局的名次概率，就能构造逐局的中间奖励。
+
+\textbf{输入}：一场半庄是逐局序列，第 $k$ 局的特征为 7 维向量
+\[
+x_k = \big[\,\underbrace{g_k}_{\text{grand\_kyoku}},\ \underbrace{h_k}_{\text{本场景}},\ \underbrace{r_k}_{\text{立直棒}},\ s_{k,0},\ s_{k,1},\ s_{k,2},\ s_{k,3}\,\big] \in \R^{7},
+\]
+其中 $g_k$ 把东 1 $\dots$ 西 4 编码为 $0 \dots 11$，四家分数除以 $10^4$ 归一（开局每人 2.5）。
+
+\textbf{输出}：24 维 logits，对应 $4! = 24$ 种名次排列 $\pi$ 的打分。
+
+\subsection{模型与训练目标}
+
+网络为两层 GRU（hidden size 64），取最终隐状态过两层 MLP：
+\[
+\bm{z} = \mathrm{GRU}(x_1, \dots, x_K) \in \R^{128},\qquad
+\bm{\ell} = \mathrm{MLP}(\bm{z}) \in \R^{24}.
+\]
+
+标签：真实名次排列在 24 种排列中的下标。\texttt{get\_label} 的实现是把 24 个候选排列与真实 \texttt{rank\_by\_player} 逐元素比对，取全等的那个下标 $y^{\star}$。训练目标就是普通交叉熵：
+\[
+\mathcal{L}_{\mathrm{GRP}} = -\log \frac{\exp(\ell_{y^{\star}})}{\sum_{j=0}^{23}\exp(\ell_j)},
+\qquad \text{AdamW},\ \eta = 10^{-5},\ \text{float64}.
+\]
+
+本机训练结果（23.3 万步）：val loss $3.17 \to 2.47$，val acc $= 22.6\%$。注意这是\textbf{24 类精确命中完整排列}的准确率，随机基线仅 $1/24 \approx 4.2\%$，且 val 与 train 全程贴合——对奖励构造而言这个精度已足够。
+
+\subsection{从排列概率到名次矩阵：\texttt{calc\_matrix}}
+
+softmax 得到 24 个排列的概率后，需要\textbf{边缘化}成``每个玩家拿每个名次''的 4$\times$4 矩阵 $M$：
+\[
+\boxed{\;M_{p,r} \;=\; \Pr(\text{玩家 } p \text{ 最终第 } r{+}1 \text{ 名}) \;=\; \sum_{\pi:\ \pi(p)\,=\,r} \softmax(\bm{\ell})_{\pi}\;}
+\]
+
+即对所有``玩家 $p$ 恰好排在第 $r$ 位''的排列求概率和。代码中用一个预计算的 $(4, 24)$ 索引表 \texttt{perms\_t} 完成这个分组求和。
+
+\begin{rem}
+为什么要先预测 24 类再边缘化，而不是直接输出 4$\times$4？因为名次排列之间存在强耦合（一人升必有一人降），直接输出 16 维会丢失这种联合约束；24 类分类让 softmax 天然处理互斥与归一。
+\end{rem}
+
+% =====================================================================
+\section{阶段 2 前置：奖励构造（全流程的核心推导）}\label{sec:reward}
+
+\subsection{逐局期望顺位分}
+
+对某玩家 $p$，GRP 给出\textbf{每局结束时}的名次概率向量 $M_{k,p} \in \R^4$（第 $k$ 局结束、$r$ 取 $0\dots3$）。把逐局向量堆叠后，在末尾拼接\textbf{真实最终名次的 one-hot 向量} $\bm{e}_{\text{final}}$：
+\[
+R = \big[\,M_{0,p};\ M_{1,p};\ \dots;\ M_{K,p};\ \bm{e}_{\text{final}}\,\big] \in \R^{(K+2)\times 4}.
+\]
+
+每局结束时的期望顺位分：
+\[
+e_k = R_k^{\top} \bm{p}, \qquad \bm{p} = [6,4,2,0]^{\top}.
+\]
+
+\subsection{奖励 = 期望顺位分的差分}
+
+第 $k$ 局的奖励定义为相邻两项的差：
+\[
+\boxed{\;r_k = e_{k+1} - e_k\;}
+\]
+
+\textbf{为什么这样设计}：
+\begin{enumerate}[leftmargin=2em, label=(\arabic*)]
+  \item 打得好（和了跳满）$\Rightarrow$ GRP 上调你的一位概率 $\Rightarrow$ $e_{k+1} > e_k$，奖励为正；被炸庄则为负。终局信号被平滑地摊到了每一局。
+  \item 序列的\textbf{终点}是真实名次的 one-hot（$e_{K+1}$ 是真实顺位分），所以整条奖励链锚定在真实结局上，不是模型自说自话。
+  \item \textbf{伸缩守恒}：$\sum_k r_k = e_{K+1} - e_0$，即逐局奖励之和恰等于``真实顺位分 $-$ 开局期望顺位分''——总账始终等于真实成绩。
+\end{enumerate}
+
+\begin{rem}[Sanity check]
+开局时（东 1 开始前）四家对称，$e_0 = \frac{1}{4}(6+4+2+0) = 3$；若最终拿 2 位，$\sum_k r_k = 4 - 3 = 1$。奖励总量与实际名次严格对应。
+\end{rem}
+
+\subsection{训练样本的六元组}
+
+\texttt{dataloader.py} 把每场牌谱逐决策拆成：
+\[
+\big(\underbrace{o_i}_{\R^{1012\times 34}},\ \underbrace{a_i}_{\text{实际动作}},\ \underbrace{m_i}_{\text{合法掩码}},\ \underbrace{n_i}_{\text{steps\_to\_done}},\ \underbrace{r_{k(i)}}_{\text{该局奖励}},\ \underbrace{y_i}_{\text{该局末真实名次}}\big).
+\]
+
+两个细节：
+
+\textbf{(a) $n_i$（steps\_to\_done）的递推}：从场尾倒序扫描，
+\[
+n_i = \begin{cases} 0, & \text{第 } i \text{ 步后本场已结束},\\[2pt] n_{i+1} + \mathbb{1}[\texttt{apply\_gamma}_i], & \text{否则},\end{cases}
+\]
+即``从 $i$ 到本场结束还剩几次计入折扣的决策''，作为折扣 $\gamma^{n_i}$ 的指数。
+
+\textbf{(b) 辅助标签 $y_i$}：由各局末分数做一次双 \texttt{argsort}（分数 $\to$ 名次）得到 $y_i = \texttt{rank}[\,k(i)+1\,]$，即``该动作所在的这局打完后的真实名次''。
+
+工程上每批读 15 个文件（约 1 万条决策）进 buffer、shuffle 后吐出，近似全局随机采样。
+
+% =====================================================================
+\section{网络结构（version 4）}\label{sec:net}
+
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\footnotesize,
+  blk/.style={draw=nv, thick, rounded corners=2pt, fill=boxfill, align=center,
+              minimum width=3.4cm, minimum height=0.72cm},
+  head/.style={draw=bgblue, thick, rounded corners=2pt, fill=grpfill, align=center,
+               minimum width=3.4cm, minimum height=0.72cm},
+  arr/.style={-{Stealth[length=2.6mm]}, thick, nv},
+]
+\node[blk] (obs) {观测 $o$\\[-2pt]$1012 \times 34$};
+\node[blk, right=0.55cm of obs] (conv1) {Conv1d $1012{\to}192$\\[-2pt]BN + Mish};
+\node[blk, right=0.55cm of conv1] (res) {40 $\times$ ResBlock\\[-2pt]预激活 + 通道注意力};
+\node[blk, right=0.55cm of res] (conv2) {Conv1d $192{\to}32$\\[-2pt]Mish, Flatten};
+\node[blk, right=0.55cm of conv2] (fc) {Linear $1088{\to}1024$\\[-2pt]特征 $\phi$};
+\node[head, above right=0.35cm and 0.7cm of fc] (dqn) {DQN 头\\[-2pt]$Q(o,\cdot) \in \R^{46}$};
+\node[head, below right=0.35cm and 0.7cm of fc] (aux) {AuxNet\\[-2pt]名次 logits $\in \R^4$};
+
+\draw[arr] (obs) -- (conv1);
+\draw[arr] (conv1) -- (res);
+\draw[arr] (res) -- (conv2);
+\draw[arr] (conv2) -- (fc);
+\draw[arr] (fc.east) -- (dqn.west);
+\draw[arr] (fc.east) -- (aux.west);
+\end{tikzpicture}%
+}
+\end{center}
+
+\subsection{Brain：ResNet1d + 通道注意力}
+
+把牌桌看成 34 个位置（牌种）上的特征平面，用 Conv1d 处理。每个 ResBlock 为预激活结构
+\[
+x \mapsto x + \mathrm{CA}\big(\mathrm{Conv}(\mathrm{Mish}(\mathrm{BN}(\mathrm{Conv}(\mathrm{Mish}(\mathrm{BN}(x))))))\big),
+\]
+并挂一个 \textbf{ChannelAttention}（CBAM 式通道门控）：对空间维分别取均值与最大值，过同一个共享 MLP 后相加、sigmoid，得到逐通道权重
+\[
+\bm{w} = \sigma\Big(\mathrm{MLP}\big(\operatorname{mean}_{c}(x)\big) + \mathrm{MLP}\big(\operatorname{max}_{c}(x)\big)\Big),\qquad x' = \bm{w} \odot x.
+\]
+均值捕获整体活跃度，最大值捕获``是否存在关键模式''，二者互补；这让网络自己学会哪些特征通道重要。BatchNorm 的 momentum = 0.01（慢统计，适配分布漂移）。
+
+\subsection{DQN 头：dueling 结构（合法动作均值）}
+
+v4 的 DQN 头是单个 Linear $1024 \to 1 + 46$，拆出标量 $V$ 与优势向量 $A$：
+\[
+\boxed{\;Q(o, a) = V(\phi) + A(\phi, a) - \frac{1}{|\mathcal{A}_{\text{legal}}|}\sum_{a' \in \mathcal{A}_{\text{legal}}} A(\phi, a'),\qquad Q(o, a_{\text{illegal}}) = -\infty\;}
+\]
+
+与标准 dueling 的两点不同：
+\begin{enumerate}[leftmargin=2em, label=(\arabic*)]
+  \item 优势函数只对\textbf{合法动作}归零均值（掩码求和再除以合法数），非法动作不参与归一；
+  \item 非法动作直接置 $-\infty$：argmax 永远落在合法动作上，且后面 CQL 的 logsumexp 自动把 $e^{-\infty}=0$ 的项排除。
+\end{enumerate}
+
+\subsection{AuxNet}
+
+一个无偏置线性层 $\R^{1024} \to \R^{4}$，从共享特征 $\phi$ 预测``本局结束后的名次''，迫使 $\phi$ 编码对局走势信息，防止表示坍缩。
+
+% =====================================================================
+\section{总损失：三项逐一推导}\label{sec:loss}
+
+\[
+\boxed{\;\mathcal{L} \;=\; \underbrace{\tfrac{1}{2}\,\mathrm{MSE}\big(Q(o,a),\ \gamma^{n}\, r_{k}\big)}_{\text{DQN 蒙特卡洛回归}} \;+\; \underbrace{5\,\Big(\log {\textstyle\sum_{a'}} e^{Q(o,a')} - Q(o,a)\Big)}_{\text{CQL 保守正则}} \;+\; \underbrace{0.2\;\mathrm{CE}\big(\mathrm{AuxNet}(\phi),\ y\big)}_{\text{名次辅助任务}}\;}
+\]
+
+\subsection{第一项：蒙特卡洛 Q 回归}
+
+目标值 $\tilde{q}_i = \gamma^{n_i} \cdot r_{k(i)}$。本机 $\gamma = 1$，于是
+\[
+\tilde{q}_i = r_{k(i)},
+\]
+即\textbf{每个动作的 Q 直接回归到它所在那一局造成的期望顺位分变化}。这是关键设计决策：
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{不用 TD bootstrap}：没有 target network、没有 $Q(s')$ 自举，也就没有自举偏差——在离线数据上格外稳；
+  \item \textbf{局内信用均摊}：同一局的所有动作共享同一个 $r_k$（该局打得好，局中每个决策都被记功）；跨局的信用由 GRP 差分天然分离；
+  \item 损失系数 $\tfrac{1}{2}$ 使梯度恰为残差：$\nabla \tfrac{1}{2}(Q - \tilde{q})^2 = Q - \tilde{q}$。
+\end{itemize}
+
+\subsection{第二项：CQL 保守正则（仅离线）}
+
+\[
+\mathcal{L}_{\mathrm{CQL}} = \E_{o \sim \mathcal{D}}\Big[\underbrace{\log \sum_{a'} e^{Q(o, a')}}_{\text{压低全体 Q}} - \underbrace{Q(o, a)}_{\text{抬数据中的动作}}\Big], \qquad \text{权重 } 5.
+\]
+
+\textbf{动机}：离线数据固定，分布外（OOD）动作的 Q 值没有任何监督，回归误差会让它们被\textbf{系统性高估}；一旦推理时 argmax 选到这种动作，行为就会崩坏。logsumexp 是全体合法动作 Q 的软最大值，最小化它等价于\textbf{压低所有动作的 Q}；减去 $Q(o,a)$ 则\textbf{把数据里实际被选择（天凤高手）的动作抬回来}。两项之差恒非负（$\lse \ge$ 任意单项），最优解处数据动作与软最大值的差距最小。
+
+\begin{rem}[Sanity check]
+若模型对所有动作输出相同 Q，$\mathcal{L}_{\mathrm{CQL}} = \log |\mathcal{A}_{\text{legal}}| > 0$；只有当数据动作的 Q 显著高于其他动作时才趋近 0。这解释了 tensorboard 中 \texttt{cql\_loss} 应为正值并逐渐下降。在线模式下数据是自己产的，无 OOD 问题，故此项关闭。
+\end{rem}
+
+\subsection{第三项：名次辅助任务}
+
+\[
+\mathcal{L}_{\mathrm{aux}} = \mathrm{CE}\big(\mathrm{AuxNet}(\phi),\ y\big), \qquad \text{权重 } 0.2.
+\]
+
+标签 $y$ 是``本局结束后的真实名次''（\S\ref{sec:reward}）。作用类似 Suphx 的辅助预测任务：给表示 $\phi$ 加一个与最终成绩直接相关的监督，缓解纯 Q 回归的表示退化。
+
+% =====================================================================
+\section{优化器与学习率}\label{sec:optim}
+
+\subsection{分组 weight decay 的 AdamW}
+
+参数被分成两组（\texttt{train.py} 遍历 \texttt{named\_modules}）：
+\[
+\theta_{\text{decay}} = \{\text{Linear / Conv1d 的 weight}\},\qquad
+\theta_{\text{no-decay}} = \{\text{bias、BatchNorm 参数}\}.
+\]
+
+AdamW 的\textbf{解耦}衰减只施加在第一组：
+\[
+\theta \leftarrow \theta - \eta\big(\hat{m}_t / (\sqrt{\hat{v}_t} + \varepsilon)\big) - \eta\lambda\,\theta,\qquad \lambda = 0.1\ \text{仅作用于}\ \theta_{\text{decay}}.
+\]
+
+\textbf{为什么 BN 参数不衰减}：BN 的 scale/shift 控制特征归一化强度，对其做 L2 衰减会无意义地把激活压向零，损害表示能力——这是标准实践。
+
+\subsection{学习率调度}
+
+\texttt{LinearWarmUpCosineAnnealingLR}（线性 warmup + 余弦退火）：
+\[
+\eta_t = \begin{cases}
+\eta_{\text{init}} + \dfrac{\eta_{\text{peak}} - \eta_{\text{init}}}{t_{\text{warm}}}\, t, & t < t_{\text{warm}},\\[10pt]
+\eta_{\text{final}} + \dfrac{\eta_{\text{peak}} - \eta_{\text{final}}}{2}\Big(1 + \cos\dfrac{(t - t_{\text{warm}})\pi}{t_{\max} - t_{\text{warm}}}\Big), & t_{\text{warm}} \le t < t_{\max},\\[10pt]
+\eta_{\text{final}}, & t \ge t_{\max}.
+\end{cases}
+\]
+
+本机配置 $\eta_{\text{peak}} = \eta_{\text{final}} = 10^{-4}$、$t_{\text{warm}} = 0$，即\textbf{恒定学习率} $10^{-4}$（离线数据可以反复 epoch，不需要退火收敛）。
+
+\subsection{其余工程细节}
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{AMP 混合精度}：autocast + GradScaler；损失除以 \texttt{opt\_step\_every} 实现梯度累积，累积满才 \texttt{scaler.step} + \texttt{update}；
+  \item \texttt{scheduler.step()} 每个 batch 调用一次（不是每个优化步）；
+  \item 每 \texttt{save\_every} = 400 步：保存含 optimizer/scheduler/scaler 全状态的 checkpoint（可无缝续训），并把\textbf{预测 Q 与目标 Q 的直方图}写入 tensorboard——两者叠合程度是回归质量的直接可视化；
+  \item $\gamma = 1$ 时目标量级在 $\pm 6$ 以内，Q 值不会爆炸，这是可以用恒定 lr 长训的前提之一。
+\end{itemize}
+
+% =====================================================================
+\section{两层迭代机制}\label{sec:iter}
+
+\subsection{内层：梯度下降}
+
+每个 batch 计算 $\mathcal{L}$（\S\ref{sec:loss}），反向传播更新 Brain、DQN、AuxNet 的全部参数。离线模式对整个文件列表跑一个 epoch 即退出（便于人工控制），重启时从 checkpoint 续训。
+
+\subsection{外层：test\_play 评估与 baseline 自我提升}
+
+\textbf{每 \texttt{test\_every} = 20000 步}触发一次对局评估：
+
+\begin{enumerate}[leftmargin=2em, label=(\arabic*)]
+  \item 用 \texttt{OneVsThree} 竞技场打 3000 场：\textbf{1 个当前模型 vs 3 个 baseline}（\texttt{baseline.pth}，本机为社区 298k 步权重），全程 eval、无探索；
+  \item 统计 \texttt{avg\_rank}（2.5 = 随机）、\texttt{avg\_pt} 及和牌/放铳/立直率等行为指标；
+  \item \textbf{双条件}刷新最好模型：
+  \[
+  \texttt{better} \iff \big(\texttt{avg\_pt} \ge \texttt{best.avg\_pt}\big)\ \textbf{且}\ \big(\texttt{avg\_rank} \le \texttt{best.avg\_rank}\big),
+  \]
+  两个指标同时不劣才复制为 \texttt{best.pth}——宁可保守，防止评估噪声把 checkpoint 刷掉；
+  \item \textbf{自我提升外循环}：指标稳定后执行 \texttt{cp best.pth baseline.pth} 再训一轮。评估对手变成更强的自己，模型被迫继续进步，可重复 2--3 轮。
+\end{enumerate}
+
+\begin{rem}
+这与 Suphx 的思路同源：监督/离线学到的是``模仿强者''，而对局评估闭环提供的是``超越强者''的压力。双条件判定相当于对噪声评估加了一个保守的接受域。
+\end{rem}
+
+% =====================================================================
+\section{阶段 3（可选）：在线自对弈}\label{sec:online}
+
+三进程架构：\texttt{server.py}（参数分发与牌谱中转）$\rightleftarrows$ \texttt{client.py}（自对弈，可多开）$\rightleftarrows$ \texttt{train.py}（\texttt{online=true}）。与离线模式的差异：
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{l p{4.9cm} p{6.3cm}}
+  \toprule
+  组件 & 离线模式 & 在线模式 \\
+  \midrule
+  数据来源 & 天凤牌谱（固定） & client 自对弈实时产生 \\
+  探索 & 无（数据已含人类策略） & Boltzmann：$\varepsilon = 0.005$，$T = 0.05$ \\
+  CQL 正则 & 开启（$\times 5$） & \textbf{关闭}（无 OOD 问题） \\
+  BatchNorm & 正常更新 & \textbf{冻结}（\texttt{freeze\_bn=true}） \\
+  参数同步 & --- & 每 \texttt{submit\_every} 步推给 server \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+在线时 client 以 Boltzmann 探索采样动作（$\Pr(a) \propto e^{Q/T}$，温度 $T = 0.05$ 使分布接近贪心、保留少量探索），牌谱经 server 缓冲后被训练进程 \texttt{drain} 取走。BN 冻结是因为自对弈数据分布随参数快速漂移，小批量统计会抖动。
+
+% =====================================================================
+\section{超参数速查表（本机 \texttt{config.toml}）}
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{lll}
+  \toprule
+  类别 & 参数 & 值 \\
+  \midrule
+  数据 & batch\_size / file\_batch\_size / num\_workers & 512 / 15 / 0（Windows 共享内存坑） \\
+  环境 & $\gamma$ / pts & 1 / $[6,4,2,0]$ \\
+  网络 & conv\_channels / num\_blocks / version & 192 / 40 / 4 \\
+  损失 & CQL 权重 / 辅助权重 & 5 / 0.2 \\
+  优化器 & AdamW：betas / $\varepsilon$ / weight\_decay & $(0.9, 0.999)$ / $10^{-8}$ / 0.1（分组） \\
+  调度 & peak / final & $10^{-4}$ / $10^{-4}$（恒定） \\
+  节奏 & save\_every / test\_every / test 局数 & 400 / 20000 / 3000 \\
+  GRP & GRU $2\times64$ / lr / batch & 24 类输出 / $10^{-5}$ / 512 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+% =====================================================================
+\section{记忆锚点}
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{``GRP 把终局信号摊到每一局''}：奖励 $=$ 期望顺位分的差分 $r_k = \Delta\,\E[\text{顺位分}]$，且伸缩守恒 $\sum_k r_k = $ 真实顺位分 $-$ 开局期望。同原理：Suphx 的 global reward prediction；围棋的胜率差分 shaping。
+  \item \textbf{``离线 RL $=$ 回归 $+$ 保守项''}：见过的动作抬高、没见过的压低；在线后把 CQL 关掉就是它的逆向应用。
+  \item \textbf{``两层迭代''}：内层 AdamW 更新参数，外层 \texttt{best.pth} $\to$ \texttt{baseline.pth} 更新对手——评估对手变强，模型才被迫继续变强。
+\end{enumerate}
+
+\end{document}

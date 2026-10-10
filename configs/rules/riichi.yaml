@@ -1,0 +1,13 @@
+# 日麻（四人）规则描述 —— 与 src/mahjong_rl/engines/riichi/__init__.py 的 RIICHI_SPEC 保持一致
+name: riichi
+players: 4
+tile_count: 136
+tile_kinds: 34
+action_space: 46
+obs_shape: [1012, 34]
+has_riichi: true
+has_chii: true
+has_honors: true
+queque: false
+multi_win: false
+notes: 天凤四人东/南场；红宝牌 5mr/5pr/5sr；振听；宝牌指示牌

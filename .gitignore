@@ -1,0 +1,49 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.venv.bak-old-laptop/
+
+# ---- 数据与训练产物（不入库）----
+data/
+runs/
+eval_results/
+*.pt
+*.ptb
+*.pth
+*.ckpt
+*.onnx
+*.parquet
+*.mjson
+*.mjlog
+*.jsonl
+
+# ---- 第三方克隆（另行用 submodule 管理，见 README）----
+third_party/Mortal/
+
+# ---- 前端 / 图表 ----
+node_modules/
+dist/
+*.local
+
+# ---- Rust 工具链与本机环境留档 ----
+.toolchain/
+installers/
+target/
+
+# ---- 日志与临时文件 ----
+*.log
+*.err
+*.tmp
+Thumbs.db
+.DS_Store
+
+# ---- 编辑器 ----
+.vscode/
+!.vscode/settings.json
+
+# ---- 不进公共仓库：隧道部署物料 / 二进制 / 版权文献 ----
+apps/mahjong-play/tunnel/
+*.exe
+docs/refs/
